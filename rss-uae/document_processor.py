@@ -9,6 +9,7 @@ from typing import Dict, Any, List
 from openai import AzureOpenAI
 from src.logger import logger
 from src.config import Config
+from src.themes.group_output_themes import get_grouped_themes
 
 class DocumentProcessor:
     """
@@ -52,33 +53,78 @@ You are an expert legal document analyst specializing in government gazettes and
 
 You MUST follow these instructions literally and precisely."""
     
-    def process_document(self, extracted_text: str, themes: list, pdf_filename: str) -> List[Dict[str, Any]]:
+    def process_document(self, extracted_text: str, themes: list, rss_link: str) -> List[Dict[str, Any]]:
         """Process document with 2-step validation approach"""
         
-        logger.info(f"Processing document: {pdf_filename}")
+        logger.info(f"Processing document: {rss_link}")
         
         # Step 1: Initial extraction by junior analyst
         logger.info("Step 1: Junior analyst - Initial document analysis...")
-        initial_result = self._extract_document_data(extracted_text, themes, pdf_filename)
+        initial_result = self._extract_document_data(extracted_text, themes, rss_link)
         
         # Step 2: Senior analyst - Validation check only (using same extracted_text)
         logger.info("Step 2: Senior analyst - Validation check...")
-        validation_result = self._validate_extraction(extracted_text, initial_result, pdf_filename)
+        validation_result = self._validate_extraction(extracted_text, initial_result, rss_link)
         
         # Use initial result if validation passes, otherwise try to improve
         if validation_result.get("all_correct", True):
             logger.info("✅ All fields validated correctly - using initial extraction")
-            return [initial_result] if not isinstance(initial_result, list) else initial_result
+            final_result = initial_result
         else:
             logger.info("⚠️ Issues found - Attempting to improve extraction...")
-            final_result = self._improve_extraction(extracted_text, initial_result, validation_result, themes, pdf_filename)
-            return [final_result] if not isinstance(final_result, list) else final_result
+            final_result = self._improve_extraction(extracted_text, initial_result, validation_result, themes, rss_link)
+        
+        # Add all programmatic fields after validation is complete
+        current_date = datetime.now().strftime('%Y-%m-%d')
+        
+        # Add system fields that should not be extracted by AI
+        final_result["unique_id"] = str(uuid.uuid4())
+        final_result["document_type"] = "Government Gazette"
+        final_result["jurisdiction"] = "United Arab Emirates"
+        final_result["iso_country_code"] = "AE"
+        final_result["state"] = "Federal"
+        final_result["file_path"] = rss_link
+        final_result["date_added"] = current_date
+        final_result["language"] = "English"
+        
+        # Generate _id
+        notice_num = final_result.get("notice_number", "unknown")
+        final_result['_id'] = f"{notice_num}_{current_date}"
+        
+        # Handle phi_theme_categorized exactly like gpt_extraction.py
+        if "None" in final_result.get("phi_themes", []):
+            final_result["phi_themes"] = []
+        grouped_themes = get_grouped_themes(final_result.get("phi_themes", []))
+        final_result["phi_theme_categorized"] = grouped_themes
+        
+        # Generate blob name
+        from urllib.parse import urlparse
+        import os
+        parsed_url = urlparse(rss_link)
+        rss_filename = os.path.basename(parsed_url.path) or "document.pdf"
+        final_result['blob_name'] = f"documents/{current_date}/{rss_filename}"
+        
+        # Handle date logic exactly like gpt_extraction.py
+        if (
+            final_result.get("document_date") == "None"
+            and final_result.get("notice_date") != "None"
+        ):
+            final_result["document_date"] = final_result["notice_date"]
+            logger.info("Added notice date to document date.")
+        elif (
+            final_result.get("notice_date") == "None"
+            and final_result.get("document_date") != "None"
+        ):
+            final_result["notice_date"] = final_result["document_date"]
+            logger.info("Added document date to notice date.")
+        
+        return [final_result] if not isinstance(final_result, list) else final_result
     
-    def _extract_document_data(self, extracted_text: str, themes: list, pdf_filename: str) -> Dict[str, Any]:
+    def _extract_document_data(self, extracted_text: str, themes: list, rss_link: str) -> Dict[str, Any]:
         """Initial extraction by junior analyst"""
         
         try:
-            prompt = self.create_extraction_prompt(extracted_text, themes, pdf_filename)
+            prompt = self.create_extraction_prompt(extracted_text, themes, rss_link)
             
             logger.info("Sending request to Azure OpenAI...")
             
@@ -94,6 +140,7 @@ You MUST follow these instructions literally and precisely."""
                         "content": prompt
                     }
                 ],
+                max_tokens=4000
             )
             
             response_content = response.choices[0].message.content.strip()
@@ -118,22 +165,26 @@ You MUST follow these instructions literally and precisely."""
                        f"Output: {token_usage.completion_tokens}")
             
             try:
-                result = json.loads(response_content)
+                # Parse the AI response first (should be an array from new prompt)
+                parsed_response = json.loads(response_content)
+                
+                # If it's an array, take the first item; otherwise use as-is
+                if isinstance(parsed_response, list) and len(parsed_response) > 0:
+                    ai_extracted_data = parsed_response[0]
+                else:
+                    ai_extracted_data = parsed_response
+                
+                # Only keep AI extracted data - no programmatic fields here
+                result = ai_extracted_data
                 
                 self._fix_output_structure(result)
                 
-                # Update token usage in the result
+                # Update token usage
                 result["total_token_usage"] = {
                     "total_tokens": token_usage.total_tokens,
                     "output_tokens": token_usage.completion_tokens,
                     "input_tokens": token_usage.prompt_tokens
                 }
-                
-                # Add required fields if missing
-                if "unique_id" not in result:
-                    result['unique_id'] = str(uuid.uuid4())
-                if "date_added" not in result:
-                    result['date_added'] = datetime.today().strftime("%Y-%m-%d")
                 
                 return result
                 
@@ -146,174 +197,111 @@ You MUST follow these instructions literally and precisely."""
             logger.error(f"OpenAI processing failed: {e}")
             raise Exception(f"Failed to process document with OpenAI: {e}")
 
-    def create_extraction_prompt(self, extracted_text: str, themes: list, pdf_filename: str) -> str:
+    def create_extraction_prompt(self, extracted_text: str, themes: list, rss_link: str) -> str:
         
-        current_date = datetime.now().strftime('%Y-%m-%d')
-        
-        # Format themes for the prompt
-        themes_str = ""
-        if themes and len(themes) > 0:
-            themes_str = f"""
-
-## AVAILABLE THEMES
-Use ONLY these themes when categorizing the document content:
-{', '.join(themes)}
-
-**Important**: Only use themes from the above list that are relevant to the document content. Do not create new themes."""
+        # Format themes for the prompt - exactly like gpt_extraction.py
+        themes_str = ', '.join([f'"{theme}"' for theme in themes]) if themes else ''
         
         prompt = f"""<document>
-<filename>{pdf_filename}</filename>
+<filename>{rss_link}</filename>
 <content>
 {extracted_text}
 </content>
 </document>
-{themes_str}
 
-# COMPREHENSIVE DOCUMENT ANALYSIS INSTRUCTIONS
-
-## PRIMARY ANALYSIS METHODOLOGY
-1. **Step-by-step Analysis**: Slowly analyze the complete content of this document
-2. **Language Processing**: Output must be strictly in English, even if input is in different language
-3. **Document Type Identification**: Identify the exact type of notice/document
-4. **Verbatim Extraction**: Extract values directly from document without external information
-5. **Theme Identification**: Identify and extract the actual themes/topics based on document content
-6. **Relevance Assessment**: Determine if document requires specific actions from organizations
-
-## CRITICAL EXTRACTION RULES
-- **ACCURACY FIRST**: Extract only explicitly stated information
-- **NO EMPTY VALUES**: Never leave strings empty ("") or lists empty ([])
-- **DATE PRECISION**: All dates must be in YYYY-MM-DD format, calculate if needed
-- **COMPLETE EXTRACTION**: Extract comprehensive information for each field
-- **VERBATIM WHEN POSSIBLE**: Use exact text from document for names and titles
-
-## STRUCTURED OUTPUT FORMAT
-You MUST return a valid JSON object with this EXACT structure:
+1. Slowly analyze step by step the content of this Government Gazette document.
+2. Extract detailed information corresponding to each notice. The output must strictly be in English language. Even if the input is in a different language, please ensure that the output is in English.
+3. Identify the types of notices. Choose the correct notice_type from this list: ["Guidance", "Regulation", "Standard", "Policy", "Ministerial Decision", "Law", "Circular", "Checklist", "Framework", "General", "Resolution", "Directive", "Notification", "Order", "Decree", "Memorandum", "Bulletin", "Instruction", "Draft Guidance", "Consultation Paper", "Act", "Amendment", "Procedure", "Manual", "Protocol", "Specification", "Form", "Template", "Report", "White Paper", "Green Paper", "Charter", "Treaty", "Council Resolution", "Declaration", "Statement"].
+4. Strictly retrieve and extract the values from the document. Do not add any external information. The value extracted should strictly belong to the notice. Perform step by step extraction. For each field, extract information and ensure it is verbatim from the text and do not generate any additional information.
+5. For the themes, please take your time and carefully classify if the given notice falls into any of the themes in the provided list: [{themes_str}]. Please select all the themes that are related to the notice accurately. Provide the output in a list. Make sure to include all the themes that are relevant to the notice. Try to include as many as possible but make sure they are relevant to the notice. If you find multiple themes, please include all of them in the list. Do not leave the list empty. STRICTLY FOLLOW THIS OUTPUT FORMAT: ["theme1", "theme2"]
+6. For enforcement_date, extract start date in which the notice or enforcement is enforced or the date of decision or the date for regulation to enter into force. Convert the date to YYYY-MM-DD format. If there is no date of enforcement or decision then keep it as "None". Make sure it is extremely accurate and correct. There might be cases where "the regulations shall come into effect after x days from the date of publication". In such cases, calculate the date by adding x in date of publication and provide the enforcement date accordingly. Instead of date of publication, it can be issuance or something else so make sure to calculate the date accordingly. If there is no clear date then keep it as "None".
+7. For comments_due_date, identify and extract the submission deadline for comments. Convert the date to YYYY-MM-DD format. If the due date is contingent upon another date (e.g., publication date), calculate the due date accordingly and provide it in the specified format. If no due date is mentioned or if it cannot be determined, indicate "None." Make sure it is extremely accurate and correct.
+8. Extract detailed description of the notice from the document. The description should be long and detailed capturing all the key points, dates, impacted parties and actions mentioned in the notice. The description should be at least 1000 words long and should be comprehensive.
+9. Evaluate the impact of the notice across multiple dimensions and assign an appropriate impact score for each category. Use the scale: Very_Low, Low, Moderate, High, Very_High, Critical to reflect the significance and reach of the impact.
+10. Provide a JSON structure with the following format for each notice and fill each keys with values and do not leave any of them empty at all. Strictly ensure that there SHOULD NOT be any empty string like "" and NOT be any empty list like []. This is a top priority. If there is no content present in the file for a key then mention "None". But do this absolutely if and only if there is no content / answer for that. Else try to extract as many details as possible.
 
 ```json
-{{
-    "_id": "generate_simple_id_based_on_notice_number_and_date",
-    "unique_id": "generate_valid_uuid4_format",
-    "document_type": "determine_from_list: ['Guidance', 'Regulation', 'Standard', 'Policy', 'Ministerial Decision', 'Law', 'Circular', 'Checklist', 'Framework', 'General', 'Resolution', 'Directive', 'Notification', 'Order', 'Decree', 'Memorandum', 'Bulletin', 'Instruction', 'Draft Guidance', 'Consultation Paper', 'Act', 'Amendment', 'Procedure', 'Manual', 'Protocol', 'Specification', 'Form', 'Template', 'Report', 'White Paper', 'Green Paper', 'Charter', 'Treaty', 'Council Resolution', 'Declaration', 'Statement']",
-    "jurisdiction": "extract_governing_authority_name",
-    "iso_country_code": "determine_ISO_3166_code_based_on_jurisdiction",
-    "state": "extract_state_province_emirate_name",
-    "file_path": "{pdf_filename}",
-    "date_added": "{current_date}",
-    "language": "determine_primary_document_language",
-    "agency": "extract_issuing_agency_authority_name",
-    "notice_name": "extract_complete_official_title_exactly_as_written",
-    "notice_number": "extract_exact_official_reference_number",
-    "notice_date": "extract_issuance_date_YYYY-MM-DD_format",
-    "notice_type": "extract_exact_classification_from_document",
-    "document_name": "extract_exact_publication_name",
-    "document_number": "extract_exact_publication_issue_number",
-    "document_date": "extract_exact_publication_date_YYYY-MM-DD",
-    "department_name": "extract_complete_issuing_department_ministry_name",
-    "phi_themes": ["identify_and_extract_themes_topics_based_on_actual_document_content"],
-    "actors_in_play": ["extract_all_named_individuals_organizations_entities"],
-    "outcome_decisions": ["extract_all_explicit_decisions_rulings_determinations"],
-    "outcome_reason": ["extract_all_stated_reasons_rationale_justifications"],
-    "affected_parties": ["extract_all_parties_explicitly_mentioned_as_affected"],
-    "acts_regs_referred": ["extract_complete_names_of_laws_regulations_acts_referenced"],
-    "obligations": ["extract_all_explicitly_stated_requirements_duties_mandates"],
-    "compliance_terms": ["extract_all_specific_compliance_requirements_mentioned"],
-    "changes_in_acts": ["extract_explicit_amendments_modifications_to_existing_laws"],
-    "key_points_of_interest": ["extract_all_significant_points_highlighted_in_document"],
-    "industries_affected": ["extract_all_business_sectors_industries_specifically_mentioned"],
-    "regulators_impacted": ["extract_all_regulatory_bodies_explicitly_named"],
-    "fines_or_penalties": ["extract_exact_penalty_amounts_fine_structures_stated"],
-    "relevant_study_type": "identify_if_clinical_trials_RWE_NIS_registries_etc",
-    "status": "determine_from_list: ['Draft', 'Finalized', 'Implemented', 'New']",
-    "action_required": "yes_or_no_based_on_client_relevance_and_required_actions",
-    "internal_owner_stakeholder_impacted": ["extract_relevant_stakeholders_from_client_profile"],
-    "government_bodies_impacted": ["extract_all_government_entities_specifically_mentioned"],
-    "jurisdictions_impacted": ["extract_all_geographic_jurisdictions_explicitly_stated"],
-    "regions_affected": ["extract_all_specific_regions_locations_mentioned"],
-    "description": "generate_comprehensive_1000_plus_words_description_covering_all_key_aspects",
-    "dates": {{
-        "enforcement_date": "extract_enforcement_start_date_YYYY-MM-DD_or_None",
-        "applicable_date": "extract_applicable_date_YYYY-MM-DD_or_None", 
-        "comments_due_date": "extract_comments_deadline_YYYY-MM-DD_or_None",
-        "guidance_issued_date": "extract_guidance_issued_date_YYYY-MM-DD_or_None",
-        "expiry_date": "extract_expiry_date_YYYY-MM-DD_or_None",
-        "withdrawal_date": "extract_withdrawal_date_YYYY-MM-DD_or_None",
-        "extension_date": "extract_extension_date_YYYY-MM-DD_or_None",
-        "publication_date": "extract_publication_date_YYYY-MM-DD_or_None",
-        "effective_date": "extract_effective_date_YYYY-MM-DD_or_None",
-        "exception_from_date": "extract_exception_start_date_YYYY-MM-DD_or_None",
-        "exception_to_date": "extract_exception_end_date_YYYY-MM-DD_or_None",
-        "due_date": "extract_general_deadline_YYYY-MM-DD_or_None",
-        "compliance_due_date": "extract_compliance_deadline_YYYY-MM-DD_or_None",
-        "meeting_date": "extract_meeting_hearing_date_YYYY-MM-DD_or_None",
-        "hearing_date": "extract_hearing_consultation_date_YYYY-MM-DD_or_None"
-    }},
-    "impact_score": {{
-        "outcome_decisions_impact_score": "rate_significance_of_decisions: Very_Low/Low/Moderate/High/Very_High/Critical",
-        "affected_parties_impact_score": "rate_number_importance_of_affected_parties: Very_Low/Low/Moderate/High/Very_High/Critical",
-        "acts_regs_referred_impact_score": "rate_importance_of_referenced_legislation: Very_Low/Low/Moderate/High/Very_High/Critical",
-        "obligations_impact_score": "rate_complexity_burden_of_obligations: Very_Low/Low/Moderate/High/Very_High/Critical",
-        "compliance_terms_impact_score": "rate_stringency_of_compliance_requirements: Very_Low/Low/Moderate/High/Very_High/Critical",
-        "changes_in_acts_impact_score": "rate_significance_of_legislative_changes: Very_Low/Low/Moderate/High/Very_High/Critical",
-        "key_points_of_interest_impact_score": "rate_importance_of_highlighted_points: Very_Low/Low/Moderate/High/Very_High/Critical",
-        "industries_affected_impact_score": "rate_breadth_depth_of_industry_impact: Very_Low/Low/Moderate/High/Very_High/Critical",
-        "regulators_impacted_impact_score": "rate_number_importance_of_regulators: Very_Low/Low/Moderate/High/Very_High/Critical",
-        "fines_or_penalties_impact_score": "rate_severity_of_financial_penalties: Very_Low/Low/Moderate/High/Very_High/Critical",
-        "government_bodies_impacted_impact_score": "rate_level_scope_of_government_involvement: Very_Low/Low/Moderate/High/Very_High/Critical",
-        "jurisdictions_impacted_impact_score": "rate_geographic_scope_of_jurisdictional_impact: Very_Low/Low/Moderate/High/Very_High/Critical",
-        "regions_affected_impact_score": "rate_geographic_scope_of_regional_impact: Very_Low/Low/Moderate/High/Very_High/Critical",
-        "overall_impact_score": "rate_aggregate_total_impact: Very_Low/Low/Moderate/High/Very_High/Critical"
-    }},
-    "phi_theme_categorized": {{}},
-    "blob_name": "documents/{current_date}/{pdf_filename}",
-    "report": "generate_comprehensive_markdown_report_2_3_paragraphs_minimum",
-    "total_token_usage": {{
-        "total_tokens": 0,
-        "output_tokens": 0,
-        "input_tokens": 0
+[
+    {{
+        "notice_name": "[SHOULD_BE_THE_FULL_TITLE_OF_THE_NOTICE_NAME_EXTRACTED_FROM_CONTENTS_PAGE]",
+        "notice_number": "[THE_SPECIFIC_NUMBER_OF_THE_NOTICE]",
+        "notice_date": "[SHOULD_BE_THE_NOTICE_ISSUED_DATE_CONVERTED_TO_YYYY-MM-DD_FORMAT_IT_CAN_ALSO_BE_FOUND_AT_THE_END_OF_EACH_NOTICE]",
+        "notice_type": "[CHOOSE_ONE_FROM_THE_LIST_GIVEN_ABOVE_AS_PER_THE_CITY]",
+        "document_name": "[NAME_OF_THE_DOCUMENT_WHERE_THE_NOTICE_IS_PUBLISHED]",
+        "document_number": "[EXTRACT_THE_SPECIFIC_EDITION_OR_ISSUE_NUMBER_OF_THE_DOCUMENT]",
+        "document_date": "[SHOULD_BE_THE_DOCUMENT_PUBLISHED_DATE_CONVERTED_TO_YYYY-MM-DD_FORMAT]",
+        "department_name": "[THE_NAME_OF_THE_DEPARTMENT_OR_AUTHORITY_RESPONSIBLE_FOR_THE_NOTICE]",
+        "phi_themes": [EXTRACT_THE_THEMES_OF_THE_NOTICE_FROM_THE_LIST_OF_THEMES_GIVEN_ABOVE],
+        "actors_in_play": [EXTRACT_LIST_OF_KEY_ACTORS_OR_ENTITIES_INVOLVED_OR_MENTIONED_IN_THAT_SPECIFIC_NOTICE_ONLY],
+        "outcome_decisions": [EXTRACT_DETAILED_LIST_OF_DECISIONS_AND_OUTCOMES_RESULTING_FROM_THE_NOTICE_CAPTURING_SPECIFIC_ACTIONS_RESPONSIBILITIES_AND_ROLES_OF_ENTITIES_INVOLVED_FROM_DOCUMENT_INCLUDE_ALL_NEW_POWERS_OR_NEW_DECISIONS_GIVEN_AND_OR_TAKEN_INSIDE_THE_NOTICE],
+        "outcome_reason": [EXTRACT_LIST_OF_REASONS_FOR_THE_OUTCOMES_OR_DECISIONS_OF_THAT_NOTICE_FROM_DOCUMENT],
+        "affected_parties": [EXTRACT_LIST_OF_PARTIES_AFFECTED_BY_THE_NOTICE_FROM_DOCUMENT],
+        "acts_regs_referred": [EXTRACT_LIST_OF_ALL_LAWS_ACTS_REGULATIONS_REFERENCED_STRICTLY_WITHIN_THE_NOTICE_WITH_THEIR_COMPLETE_NAME],
+        "obligations": [EXTRACT_COMPLETE_LIST_OF_THE_OBLIGATIONS_IMPOSED_BY_THE_NOTICE_INCLUDING_ALL_THE_DETAILS_OF_OBLIGATIONS_FROM_DOCUMENT],
+        "compliance_terms": [EXTRACT_LIST_OF_TERMS_AND_CONDITIONS_FOR_COMPLIANCE_WITH_THE_NOTICE_FROM_DOCUMENT_DON'T_KEEP_IT_EMPTY],
+        "changes_in_acts": [EXTRACT_LIST_OF_CHANGES_TO_THE_EXISTING_ACT_OR_LAW_AS_A_RESULT_OF_THE_NOTICE_FROM_THE_DOCUMENT.MENTION_THE_NAME_OF_THE_ACT_REGULATION_OR_LAW_AS_WELL_AS_WHAT_CHANGE_IS_MADE_BUT_IF_NO_CHANGE_WAS_MADE_THEN_MENTION_NONE],
+        "key_points_of_interest": [EXTRACT_COMPLETE_LIST_OF_DETAILED_DESCRIPTION_OF_THE_KEY_POINTS_OF_INTEREST_ALONG_WITH_ALL_THE_DETAILS_OF_KPI_FROM_DOCUMENT],
+        "industries_affected": [EXTRACT_LIST_OF_INDUSTRIES_AFFECTED_BY_THE_NOTICE_FROM_DOCUMENT],
+        "regulators_impacted": [EXTRACT_LIST_OF_REGULATORS_IMPACTED_BY_THE_NOTICE_FROM_DOCUMENT],
+        "fines_or_penalties": [EXTRACT_LIST_OF_FINES_OR_PENALTIES_MENTIONED_IN_THE_NOTICE_FROM_DOCUMENT],
+        "government_bodies_impacted": [EXTRACT_LIST_OF_GOVERNMENT_BODIES_IMPACTED_BY_THE_NOTICE_FROM_DOCUMENT],
+        "jurisdictions_impacted": [EXTRACT_LIST_OF_JURISDICTIONS_IMPACTED_BY_THE_NOTICE_FROM_DOCUMENT],
+        "regions_affected": [EXTRACT_LIST_OF_REGIONS_OR_STATES_AFFECTED_BY_THE_NOTICE_FROM_DOCUMENT],
+        "description": "EXTRACT_LONG_AND_DETAILED_1000_WORDS_MAKE_IT_COMPREHENSIVE_DESCRIPTION_OF_THE_NOTICE_FROM_DOCUMENT_INCLUDING_ALL_THE_KEY_POINTS_DATES_AND_IMPACTED_PARTIES_AND_ACTIONS_MENTIONED",
+        "report": "GENERATE_A_COMPREHENSIVE_MARKDOWN_REPORT_2_3_PARAGRAPHS_MINIMUM_SUMMARIZING_THE_NOTICE_INCLUDING_KEY_DETAILS_IMPACT_AND_IMPLICATIONS",
+        "dates": {{
+            "enforcement_date": "EXTRACT_THE_START_DATE_IN_WHICH_THE_NOTICE_OR_REGULATION_IS_ENFORCED_OR_THE_DATE_OF_DECISION_OR_THE_DATE_FOR_REGULATION_TO_ENTER_INTO_FORCE_CONVERTED_TO_YYYY-MM-DD_FORMAT",
+            "applicable_date": "<EXTRACT APPLICABLE DATE IN YYYY-MM-DD FORMAT IF PRESENT>",
+            "comments_due_date": "<EXTRACT COMMENTS DUE DATE IN YYYY-MM-DD FORMAT IF PRESENT>",
+            "guidance_issued_date": "<EXTRACT GUIDANCE ISSUED DATE IN YYYY-MM-DD FORMAT IF PRESENT>",
+            "expiry_date": "<EXTRACT EXPIRY DATE IN YYYY-MM-DD FORMAT IF PRESENT>",
+            "withdrawal_date": "<EXTRACT WITHDRAWAL DATE IN YYYY-MM-DD FORMAT IF PRESENT>",
+            "extension_date": "<EXTRACT EXTENSION DATE IN YYYY-MM-DD FORMAT IF PRESENT>",
+            "publication_date": "<EXTRACT PUBLICATION DATE IN YYYY-MM-DD FORMAT IF PRESENT>",
+            "exception_from_date": "<EXTRACT EXCEPTION FROM DATE IN YYYY-MM-DD FORMAT IF PRESENT>",
+            "exception_to_date": "<EXTRACT EXCEPTION TO DATE IN YYYY-MM-DD FORMAT IF PRESENT>",
+            "due_date": "<EXTRACT DUE DATE IN YYYY-MM-DD FORMAT IF PRESENT>",
+            "compliance_due_date": "<EXTRACT COMPLIANCE DUE DATE IN YYYY-MM-DD FORMAT IF PRESENT>",
+            "meeting_date": "<EXTRACT MEETING DATE IN YYYY-MM-DD FORMAT IF PRESENT>",
+            "hearing_date": "<EXTRACT HEARING DATE IN YYYY-MM-DD FORMAT IF PRESENT>",
+            "effective_date": "<EXTRACT EFFECTIVE DATE IN YYYY-MM-DD FORMAT IF PRESENT>"
+        }},
+        "impact_score": {{
+            "outcome_decisions_impact_score": "Give a impact score based on: How significant are the decisions made? Do they set precedents or have wide-reaching consequences?",
+            "affected_parties_impact_score": "Give a impact score based on: How many individuals, organizations, or sectors are impacted?",
+            "acts_regs_referred_impact_score": "Give a impact score based on: Do the referenced laws introduce major changes or establish new legal precedents?",
+            "obligations_impact_score": "Give a impact score based on: Are there significant legal, financial, or operational burdens introduced?",
+            "compliance_terms_impact_score": "Give a impact score based on: How strict and immediate are the compliance requirements?",
+            "changes_in_acts_impact_score": "Give a impact score based on: Are existing laws being amended in a way that alters regulations or enforcement?",
+            "key_points_of_interest_impact_score": "Give a impact score based on: Do the highlighted issues indicate major shifts or critical concerns?",
+            "industries_affected_impact_score": "Give a impact score based on: How many sectors or industries are impacted?",
+            "regulators_impacted_impact_score": "Give a impact score based on: Do multiple agencies or governing bodies need to respond or adapt?",
+            "fines_or_penalties_impact_score": "Give a impact score based on: Are there significant financial penalties or legal consequences?",
+            "government_bodies_impacted_impact_score": "Give a impact score based on: Are key government agencies or departments affected?",
+            "regions_impacted_impact_score": "Give a impact score based on: Is the impact localized or does it span multiple regions or countries?",
+            "overall_impact_score": "Give a impact score : Very Low, Low, Moderate, High, Very High, Critical  based on the overall impact and significance of the notice"
+        }}
     }}
-}}
+]
 ```
 
-## SPECIFIC EXTRACTION GUIDELINES
+Guidelines:
+- Strictly maintain the above format.
+- Keep accuracy and completeness as first priority. Even if there is extensive length and detailed nature required, extract all the details.
+- Ensure that no value or list is left empty. All the keys must have non empty strings or non-empty lists.
+- Each notice should have its own dictionary.
+- The data should be extracted strictly from that particular notice only. Never extract data from other notices.
+- Properly identify the notice name and extract it exactly as present in the document.
+- Ensure that acts, laws, regulations are placed correctly to the notice that they are mentioned in.
+- Ensure as much information as possible is extracted from the document. Extract the complete list of laws, acts, regulations that is being referred to.
+- Extract content strictly from the provided document without any modifications or external additions.
+- For key points of interest, include a description and a complete list of all the given items from the documents.
+- If the value contains reference to additional information, make sure they are extracted from the document too.
+- Strictly follow the given output format. Don't add any comments.
+- The response should be in English language only.
+- In the acts_regs_referred value, include all the laws, acts, regulations mentioned in the notice along with their full name not just their numbers.
 
-### Date Processing Rules
-- **Enforcement Date**: Look for phrases like "comes into effect", "shall be enforced", "effective from"
-- **Due Dates**: Calculate based on publication date if mentioned as "x days from publication"
-- **Format Consistency**: Always convert to YYYY-MM-DD, never guess missing components
-- **Missing Dates**: Use "None" if date cannot be determined with certainty
-
-### Theme Identification
-- **Use Provided Themes**: ONLY use themes from the provided list above
-- **Relevance Check**: Select themes that are actually relevant to the document content
-- **Multiple Themes**: Include ALL relevant themes from the provided list that apply to the document
-- **No New Themes**: Do not create or invent new themes - use only from the provided list
-- **At Least One**: If document content matches any provided theme, include at least one relevant theme
-
-### Impact Scoring Criteria
-- **Very High/Critical**: Major policy changes, significant penalties, broad impact
-- **High**: Important regulatory changes, substantial requirements
-- **Moderate**: Standard updates, routine compliance requirements  
-- **Low**: Minor changes, limited scope
-- **Very Low**: Minimal impact or procedural updates
-
-### Action Requirements Assessment
-- **Action Required "yes"**: If document requires specific actions from organizations
-- **Action Required "no"**: If document is informational or not directly applicable
-
-## QUALITY ASSURANCE CHECKLIST
-Before responding, verify:
-✓ All dates are in YYYY-MM-DD format or "None"
-✓ All lists contain relevant items (never empty)
-✓ All strings are meaningful (never empty)
-✓ Document type matches one from the provided list
-✓ Themes are identified from actual document content
-✓ Impact scores use only the specified scale
-✓ JSON structure is complete and valid
-
-## FINAL INSTRUCTION
-Extract comprehensive information from the document following the above structure exactly. Generate a complete, accurate JSON response covering all aspects of the document. Focus on accuracy and completeness while ensuring no field is left empty.
-
-**RESPOND WITH ONLY THE VALID JSON OBJECT - NO OTHER TEXT**"""
+**RESPOND WITH ONLY THE VALID JSON ARRAY - NO OTHER TEXT**"""
 
         return prompt
     
@@ -337,7 +325,7 @@ Extract comprehensive information from the document following the above structur
                 date_added = result.get("date_added", datetime.now().strftime('%Y-%m-%d'))
                 result["_id"] = f"{notice_num}_{date_added}"
 
-    def _validate_extraction(self, extracted_text: str, initial_result: Dict[str, Any], pdf_filename: str) -> Dict[str, Any]:
+    def _validate_extraction(self, extracted_text: str, initial_result: Dict[str, Any], rss_link: str) -> Dict[str, Any]:
         """Step 2: Senior analyst validation - identifies mistakes only using same extracted text"""
         
         validation_prompt = f"""
@@ -365,17 +353,18 @@ Return a JSON object with validation results in this format:
         "is_notice_name_correct": true_or_false,
         "is_notice_number_correct": true_or_false,
         "is_notice_date_correct": true_or_false,
-        "is_agency_correct": true_or_false,
         "is_department_name_correct": true_or_false,
-        "is_document_type_correct": true_or_false,
-        "is_jurisdiction_correct": true_or_false,
+        "is_notice_type_correct": true_or_false,
+        "is_document_name_correct": true_or_false,
+        "is_document_date_correct": true_or_false,
         "is_phi_themes_correct": true_or_false,
         "is_actors_in_play_correct": true_or_false,
         "is_outcome_decisions_correct": true_or_false,
         "is_affected_parties_correct": true_or_false,
         "is_obligations_correct": true_or_false,
         "is_dates_correct": true_or_false,
-        "is_description_correct": true_or_false
+        "is_description_correct": true_or_false,
+        "is_report_correct": true_or_false
     }},
     "issues_found": [
         "Brief description of each issue found (if any)"
@@ -399,6 +388,7 @@ Return a JSON object with validation results in this format:
                         "content": validation_prompt
                     }
                 ],
+                max_tokens=2000
             )
             
             response_content = response.choices[0].message.content.strip()
@@ -422,7 +412,7 @@ Return a JSON object with validation results in this format:
             logger.error(f"⚠️ Validation check failed: {e}")
             return {"all_correct": True}
     
-    def _improve_extraction(self, extracted_text: str, initial_result: Dict[str, Any], validation_result: Dict[str, Any], themes: list, pdf_filename: str) -> Dict[str, Any]:
+    def _improve_extraction(self, extracted_text: str, initial_result: Dict[str, Any], validation_result: Dict[str, Any], themes: list, rss_link: str) -> Dict[str, Any]:
         """Improve extraction based on validation feedback"""
         
         try:
@@ -466,6 +456,7 @@ Return the complete corrected JSON in the same structure as the original extract
                         "content": improvement_prompt
                     }
                 ],
+                max_tokens=4000
             )
             
             response_content = response.choices[0].message.content.strip()
